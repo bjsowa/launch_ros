@@ -36,6 +36,7 @@ from launch.utilities import ensure_argument_type
 from launch.utilities import is_a_subclass
 from launch.utilities import normalize_to_list_of_substitutions
 from launch.utilities import perform_substitutions
+from launch.utilities import type_utils
 from launch_ros.parameter_descriptions import ParameterFile
 
 import lifecycle_msgs.msg
@@ -63,6 +64,7 @@ class LoadComposableNodes(Action):
         *,
         composable_node_descriptions: List[ComposableNode],
         target_container: Union[SomeSubstitutionsType, ComposableNodeContainer],
+        load_node_timeout: Optional[Union[float, SomeSubstitutionsType]] = None,
         **kwargs,
     ) -> None:
         """
@@ -77,6 +79,7 @@ class LoadComposableNodes(Action):
 
         :param composable_node_descriptions: descriptions of composable nodes to be loaded
         :param target_container: the container to load the nodes into
+        :param load_node_timeout: optional timeout for loading each composable node, in seconds
         """
         ensure_argument_type(
             target_container,
@@ -88,6 +91,8 @@ class LoadComposableNodes(Action):
         super().__init__(**kwargs)
         self.__composable_node_descriptions = composable_node_descriptions
         self.__target_container = target_container
+        self.__load_node_timeout = type_utils.normalize_typed_substitution(
+            load_node_timeout, float) if load_node_timeout is not None else None
         self.__final_target_container_name: Optional[Text] = None
         self.__logger = launch.logging.get_logger(__name__)
 
@@ -98,6 +103,9 @@ class LoadComposableNodes(Action):
 
         kwargs['target_container'] = parser.parse_substitution(
             entity.get_attr('target', data_type=str))
+
+        kwargs['load_node_timeout'] = parser.parse_if_substitutions(
+            entity.get_attr('load_node_timeout', data_type=float, optional=True, can_be_str=True))
 
         composable_nodes = entity.get_attr('composable_node', data_type=List[Entity])
         kwargs['composable_node_descriptions'] = []
@@ -131,7 +139,7 @@ class LoadComposableNodes(Action):
         # Asynchronously wait on service call so that we can periodically check for shutdown
         event = threading.Event()
 
-        def unblock(future):
+        def unblock(future=None):
             nonlocal event
             event.set()
 
@@ -144,11 +152,34 @@ class LoadComposableNodes(Action):
         response_future = self.__rclpy_load_node_client.call_async(request)
         response_future.add_done_callback(unblock)
 
+        timeout_value = None
+        if self.__load_node_timeout is not None:
+            value = type_utils.perform_typed_substitution(context, self.__load_node_timeout, float)
+            if value > 0.0:
+                timeout_value = value
+                timeout_timer = get_ros_node(context).create_timer(timeout_value, unblock)
+
         while not event.wait(1.0):
             if context.is_shutdown:
                 self.__logger.warning(
                     "Abandoning wait for the '{}' service response, due to shutdown.".format(
                         self.__rclpy_load_node_client.srv_name),
+                )
+                response_future.cancel()
+                if timeout_value is not None:
+                    timeout_timer.cancel()
+                    timeout_timer.destroy()
+                return
+
+        if timeout_value is not None:
+            timeout_timer.cancel()
+            timeout_timer.destroy()
+
+            if not response_future.done():
+                self.__logger.error(
+                    "Load node request for node '{}' timed out after {} seconds".format(
+                        request.node_name, timeout_value
+                    )
                 )
                 response_future.cancel()
                 return

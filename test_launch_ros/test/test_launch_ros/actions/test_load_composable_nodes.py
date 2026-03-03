@@ -16,6 +16,7 @@
 
 import pathlib
 import threading
+import time
 
 from composition_interfaces.srv import LoadNode
 
@@ -44,9 +45,10 @@ TEST_NODE_NAME = 'test_load_composable_nodes_node'
 
 class MockComponentContainer(rclpy.node.Node):
 
-    def __init__(self):
+    def __init__(self, delay=0.0):
         # List of LoadNode requests received
         self.requests = []
+        self.delay = delay
 
         self._context = rclpy.context.Context()
         rclpy.init(context=self._context)
@@ -70,6 +72,8 @@ class MockComponentContainer(rclpy.node.Node):
         self._thread.start()
 
     def load_node_callback(self, request, response):
+        if self.delay > 0.0:
+            time.sleep(self.delay)
         self.requests.append(request)
         response.success = True
         if request.node_namespace == '/':
@@ -103,10 +107,12 @@ def _load_composable_node(
     condition=None,
     parameters=None,
     remappings=None,
-    target_container=f'/{TEST_CONTAINER_NAME}'
+    target_container=f'/{TEST_CONTAINER_NAME}',
+    load_node_timeout=None
 ):
     return LoadComposableNodes(
         target_container=target_container,
+        load_node_timeout=load_node_timeout,
         composable_node_descriptions=[
             ComposableNode(
                 condition=condition,
@@ -123,6 +129,14 @@ def _load_composable_node(
 @pytest.fixture
 def mock_component_container():
     container = MockComponentContainer()
+    yield container
+    container.shutdown()
+
+
+@pytest.fixture
+def slow_mock_component_container():
+    """Mock container with 3-second delay for timeout testing."""
+    container = MockComponentContainer(delay=3.0)
     yield container
     container.shutdown()
 
@@ -662,3 +676,45 @@ def test_load_node_with_condition_in_group(mock_component_container):
     assert len(request.remap_rules) == 0
     assert len(request.parameters) == 0
     assert len(request.extra_arguments) == 0
+
+
+def test_load_node_with_timeout(slow_mock_component_container):
+    """Test that load_node_timeout actually times out slow services."""
+    # Test 1: Timeout is shorter than service delay - should timeout and not load node
+    start_time = time.time()
+    launch_context = _assert_launch_no_errors([
+        _load_composable_node(
+            package='foo_package',
+            plugin='bar_plugin',
+            name='test_node_timeout',
+            namespace='test_namespace',
+            load_node_timeout=0.5  # Shorter than the 3 second delay
+        )
+    ])
+    elapsed_time = time.time() - start_time
+
+    # Should timeout before the 3 second service response
+    assert elapsed_time < 3.0, f'Expected quick timeout, but took {elapsed_time:.2f} seconds'
+    # Node should NOT be registered since we skipped waiting for service response
+    assert get_node_name_count(launch_context, '/test_namespace/test_node_timeout') == 0
+
+    # Test 2: Timeout is longer than service delay - should succeed
+    start_time = time.time()
+    launch_context = _assert_launch_no_errors([
+        _load_composable_node(
+            package='foo_package',
+            plugin='bar_plugin',
+            name='test_node_success',
+            namespace='test_namespace',
+            load_node_timeout=5.0  # Longer than the 3 second delay
+        )
+    ])
+    elapsed_time = time.time() - start_time
+
+    # Should wait for the full service response (around 3-4 seconds including overhead)
+    assert elapsed_time >= 2.5, f'Should have waited for service, took {elapsed_time:.2f} seconds'
+    assert elapsed_time < 7.0, f'Should not have timed out, took {elapsed_time:.2f} seconds'
+    # Node SHOULD be registered since it completed successfully
+    assert get_node_name_count(launch_context, '/test_namespace/test_node_success') == 1
+    # Verify the container received both requests
+    assert len(slow_mock_component_container.requests) == 2
